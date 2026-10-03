@@ -1,0 +1,7 @@
+/data/
+/bin/
+/.tools/
+/.cache/
+*.exe
+*.test
+coverage.out
