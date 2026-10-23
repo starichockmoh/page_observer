@@ -156,6 +156,130 @@ func TestNormalize(t *testing.T) {
 	}
 }
 
+func TestNormalizeIgnoreMatchesOriginalDOM(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, want string
+		rules            []string
+	}{
+		{"first-child", `<main><p class="ad">advert</p><p>news</p></main>`, "news", []string{".ad", "main > p:first-child"}},
+		{"adjacent-sibling", `<main><p class="ad">advert</p><p>noise</p><p>news</p></main>`, "news", []string{".ad", ".ad + p"}},
+		{"overlapping-subtrees", `<main><div class="ad"><p>noise</p></div><p>news</p></main>`, "news", []string{".ad", ".ad p", "div.ad"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, rules := range [][]string{tc.rules, reverseRules(tc.rules)} {
+				got, err := Normalize(strings.NewReader(tc.body), rules)
+				if err != nil || got != tc.want {
+					t.Fatalf("rules=%q: got %q, want %q, err=%v", rules, got, tc.want, err)
+				}
+			}
+		})
+	}
+}
+
+func reverseRules(rules []string) []string {
+	out := append([]string(nil), rules...)
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+func TestCheckPreparationDoesNotBlockEngine(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/html"}}, Body: io.NopCloser(strings.NewReader("<p>news</p>")), Request: r}, nil
+	})}
+	e := newTestEngine(t, manualConfig(), client)
+	p := addPage(t, e, "http://example.test")
+
+	// Occupy the sole DB connection so the worker pauses in preparation, just
+	// before comparison. WaitCount identifies this point without CPU timing.
+	conn, err := e.store.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waits := e.store.db.Stats().WaitCount
+	if err := e.Enqueue(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { return e.store.db.Stats().WaitCount > waits })
+	responsive := make(chan error, 1)
+	go func() {
+		current, err := e.Get(p.ID)
+		if err == nil && current.State != "running" {
+			err = fmt.Errorf("state=%s, want running", current.State)
+		}
+		if err == nil && !errors.Is(e.Enqueue(p.ID), ErrBusy) {
+			err = errors.New("duplicate check accepted during preparation")
+		}
+		interval := "2h"
+		if err == nil {
+			if _, patchErr := e.Patch(p.ID, PagePatch{Interval: &interval}); !errors.Is(patchErr, ErrBusy) {
+				err = fmt.Errorf("patch during preparation: %v", patchErr)
+			}
+		}
+		responsive <- err
+	}()
+	select {
+	case err := <-responsive:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("check preparation holds the engine mutex")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	stopped := make(chan error, 1)
+	go func() { stopped <- e.Stop(ctx) }()
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop while preparation is blocked: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop cannot observe its deadline during preparation")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h, err := e.History(p.ID, 100, 0, false)
+	if err != nil || len(h) != 1 || h[0].Status != "initial" {
+		t.Fatalf("shutdown lost the completed result: %v, err=%v", h, err)
+	}
+}
+
+func TestDeleteDiscardsPreparedCheck(t *testing.T) {
+	e := newTestEngine(t, manualConfig(), nil)
+	p := addPage(t, e, "http://example.test")
+	r := fetchResult{check: Check{PageID: p.ID, Status: "success", CheckedAt: time.Now().UTC(), OriginalURL: p.URL, RedirectChain: []string{}}, content: "news"}
+	v, baseline, err := e.prepareCheck(p, &r, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Delete(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.complete(p.ID, &r.check, v, baseline); err != nil {
+		t.Fatal(err)
+	}
+	h, err := e.History(p.ID, 100, 0, false)
+	if err != nil || len(h) != 0 {
+		t.Fatalf("deleted page received history: %v, err=%v", h, err)
+	}
+	versions, err := e.Versions(p.ID, 100, 0)
+	if err != nil || len(versions) != 0 {
+		t.Fatalf("deleted page received a version: %v, err=%v", versions, err)
+	}
+	current, err := e.Get(p.ID)
+	if err != nil || current.LastCheckedAt != nil || !current.BaselinePending {
+		t.Fatalf("deleted page state was changed: %+v, err=%v", current, err)
+	}
+}
+
 func TestHTTPErrorRetryNonHTMLAndSize(t *testing.T) {
 	var mode atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

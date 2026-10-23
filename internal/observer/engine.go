@@ -279,26 +279,28 @@ func (e *Engine) worker() {
 		started := time.Now()
 		r := fetch(ctx, e.client, snapshot, e.cfg.RequestTimeout, e.cfg.MaxHTMLSize)
 		cancel()
-		e.mu.Lock()
-		if p.DeletedAt == nil {
-			if err := e.complete(p, &r, started); err != nil {
-				slog.Error("save check", "pageId", id, "error", err)
-			}
+		v, baseline, err := e.prepareCheck(snapshot, &r, started)
+		if err == nil {
+			err = e.complete(id, &r.check, v, baseline)
 		}
+		if err != nil {
+			slog.Error("save check", "pageId", id, "error", err)
+		}
+		e.mu.Lock()
 		delete(e.active, id)
 		p.State = "idle"
 		e.mu.Unlock()
 	}
 }
 
-func (e *Engine) complete(p *Page, r *fetchResult, started time.Time) error {
+func (e *Engine) prepareCheck(p Page, r *fetchResult, started time.Time) (*Version, bool, error) {
 	c := &r.check
 	var v *Version
 	baseline := p.BaselinePending
 	if c.Status == "success" {
 		previous, err := e.store.latestVersion(p.ID)
 		if err != nil {
-			return err
+			return nil, baseline, err
 		}
 		switch {
 		case previous == nil:
@@ -312,7 +314,7 @@ func (e *Engine) complete(p *Page, r *fetchResult, started time.Time) error {
 			c.Status = "changed"
 			c.Diff, err = difflib.GetUnifiedDiffString(difflib.UnifiedDiff{A: difflib.SplitLines(previous.Content), B: difflib.SplitLines(r.content), FromFile: fmt.Sprintf("version-%d", previous.ID), ToFile: "current", Context: 3})
 			if err != nil {
-				return err
+				return nil, baseline, err
 			}
 		}
 		if c.Status != "unchanged" {
@@ -321,6 +323,17 @@ func (e *Engine) complete(p *Page, r *fetchResult, started time.Time) error {
 		baseline = false
 	}
 	c.DurationMS = time.Since(started).Milliseconds()
+	return v, baseline, nil
+}
+
+// Keep the deletion check and transactional save under the same lock as DELETE.
+func (e *Engine) complete(id int64, c *Check, v *Version, baseline bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p := e.pages[id]
+	if p.DeletedAt != nil {
+		return nil
+	}
 	if err := e.store.saveCheck(c, v, e.cfg.VersionRetention, baseline); err != nil {
 		return err
 	}

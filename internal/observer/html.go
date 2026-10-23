@@ -17,15 +17,19 @@ func Normalize(r io.Reader, ignore []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	ignored := make(map[*html.Node]struct{})
 	for _, rule := range ignore {
 		sel, err := cascadia.Compile(rule)
 		if err != nil {
 			return "", fmt.Errorf("invalid selector: %w", err)
 		}
 		for _, n := range cascadia.QueryAll(doc, sel) {
-			if n.Parent != nil {
-				n.Parent.RemoveChild(n)
-			}
+			ignored[n] = struct{}{}
+		}
+	}
+	for n := range ignored {
+		if n.Parent != nil {
+			n.Parent.RemoveChild(n)
 		}
 	}
 	var text strings.Builder
