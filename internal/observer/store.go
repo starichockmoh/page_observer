@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS checks (
  version_id INTEGER REFERENCES versions(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS checks_page ON checks(page_id, id DESC);
+CREATE INDEX IF NOT EXISTS checks_version ON checks(version_id);
 `)
 	if err != nil {
 		db.Close()

@@ -576,6 +576,9 @@ func TestRestartPersistenceRetentionAndSoftDelete(t *testing.T) {
 	if err := e.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.db.Exec(`DROP INDEX IF EXISTS checks_version`); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -589,6 +592,14 @@ func TestRestartPersistenceRetentionAndSoftDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { e.Stop(context.Background()); s.Close() }()
+	var planID, parent, unused int
+	var plan string
+	if err := s.db.QueryRow(`EXPLAIN QUERY PLAN SELECT rowid FROM checks WHERE version_id=?`, 1).Scan(&planID, &parent, &unused, &plan); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "checks_version") {
+		t.Fatalf("version references require a full history scan after reopening: %s", plan)
+	}
 	loaded, _ := e.Get(p.ID)
 	if loaded.Interval != "1h" || len(loaded.Ignore) != 1 {
 		t.Fatal(loaded)
@@ -598,9 +609,12 @@ func TestRestartPersistenceRetentionAndSoftDelete(t *testing.T) {
 	if err != nil || len(v) != 2 {
 		t.Fatalf("retention %v %v", v, err)
 	}
-	h, _ := e.History(p.ID, 100, 0, true)
-	if len(h) != 3 || h[2].Diff == "" {
-		t.Fatal("pruning lost history diff")
+	h, err := e.History(p.ID, 100, 0, true)
+	if err != nil || len(h) != 3 || h[2].Diff == "" {
+		t.Fatalf("pruning lost history diff: %v, err=%v", h, err)
+	}
+	if h[2].VersionID != nil || h[0].VersionID == nil || h[1].VersionID == nil {
+		t.Fatalf("pruning changed the wrong version references: %+v", h)
 	}
 	deleted, _ := e.Get(q.ID)
 	if deleted.DeletedAt == nil {
