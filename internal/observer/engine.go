@@ -298,7 +298,7 @@ func (e *Engine) prepareCheck(p Page, r *fetchResult, started time.Time) (*Versi
 	var v *Version
 	baseline := p.BaselinePending
 	if c.Status == "success" {
-		previous, err := e.store.latestVersion(p.ID)
+		previous, err := e.store.latestVersion(context.Background(), p.ID)
 		if err != nil {
 			return nil, baseline, err
 		}
@@ -345,43 +345,43 @@ func (e *Engine) complete(id int64, c *Check, v *Version, baseline bool) error {
 	return nil
 }
 
-func (e *Engine) History(id int64, limit, offset int, changes bool) ([]Check, error) {
+func (e *Engine) History(ctx context.Context, id int64, limit, offset int, changes bool) ([]Check, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if _, ok := e.pages[id]; !ok {
+	_, ok := e.pages[id]
+	e.mu.Unlock()
+	if !ok {
 		return nil, ErrNotFound
 	}
-	return e.store.history(id, limit, offset, changes)
+	return e.store.history(ctx, id, limit, offset, changes)
 }
-func (e *Engine) Versions(id int64, limit, offset int) ([]Version, error) {
+func (e *Engine) Versions(ctx context.Context, id int64, limit, offset int) ([]Version, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if _, ok := e.pages[id]; !ok {
+	_, ok := e.pages[id]
+	e.mu.Unlock()
+	if !ok {
 		return nil, ErrNotFound
 	}
-	return e.store.versions(id, limit, offset)
+	return e.store.versions(ctx, id, limit, offset)
 }
-func (e *Engine) Stats() (Stats, error) {
+func (e *Engine) Stats(ctx context.Context) (Stats, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	st, err := e.store.stats()
-	if err != nil {
-		return st, err
-	}
-	st.Workers = e.cfg.Workers
-	st.QueueCapacity = e.cfg.QueueSize
+	current := Stats{Workers: e.cfg.Workers, QueueCapacity: e.cfg.QueueSize}
 	for _, p := range e.pages {
 		if p.DeletedAt == nil {
-			st.Pages++
+			current.Pages++
 		}
 		if p.State == "queued" {
-			st.Queued++
+			current.Queued++
 		}
 		if p.State == "running" {
-			st.Running++
+			current.Running++
 		}
 	}
-	return st, nil
+	e.mu.Unlock()
+	st, err := e.store.stats(ctx)
+	st.Pages, st.Queued, st.Running = current.Pages, current.Queued, current.Running
+	st.Workers, st.QueueCapacity = current.Workers, current.QueueCapacity
+	return st, err
 }
 
 // Stop rejects new jobs immediately and cancels requests. Close the store only

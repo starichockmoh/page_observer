@@ -206,7 +206,7 @@ func (a *API) history(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := a.engine.History(id, l, o, r.Pattern == "GET /pages/{id}/changes")
+	out, err := a.engine.History(r.Context(), id, l, o, r.Pattern == "GET /pages/{id}/changes")
 	if err != nil {
 		serviceError(w, err)
 		return
@@ -222,7 +222,7 @@ func (a *API) versions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := a.engine.Versions(id, l, o)
+	out, err := a.engine.Versions(r.Context(), id, l, o)
 	if err != nil {
 		serviceError(w, err)
 		return
@@ -230,7 +230,7 @@ func (a *API) versions(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, out)
 }
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
-	st, err := a.engine.Stats()
+	st, err := a.engine.Stats(r.Context())
 	if err != nil {
 		serviceError(w, err)
 		return

@@ -66,7 +66,7 @@ func eventually(t *testing.T, f func() bool) {
 }
 func runCheck(t *testing.T, e *Engine, p Page, want string) Check {
 	t.Helper()
-	before, err := e.History(p.ID, 500, 0, false)
+	before, err := e.History(context.Background(), p.ID, 500, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,13 +75,14 @@ func runCheck(t *testing.T, e *Engine, p Page, want string) Check {
 	}
 	var result Check
 	eventually(t, func() bool {
-		h, err := e.History(p.ID, 500, 0, false)
+		h, err := e.History(context.Background(), p.ID, 500, 0, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(h) > len(before) {
 			result = h[0]
-			return true
+			current, err := e.Get(p.ID)
+			return err == nil && current.State == "idle"
 		}
 		return false
 	})
@@ -123,11 +124,11 @@ func TestInitialUnchangedChangedIgnoreAndBaseline(t *testing.T) {
 	if !strings.Contains(c.Diff, "-Hello") || !strings.Contains(c.Diff, "+Goodbye") {
 		t.Fatal(c.Diff)
 	}
-	versions, err := e.Versions(p.ID, 100, 0)
+	versions, err := e.Versions(context.Background(), p.ID, 100, 0)
 	if err != nil || len(versions) != 4 {
 		t.Fatalf("versions=%v err=%v", versions, err)
 	}
-	st, err := e.Stats()
+	st, err := e.Stats(context.Background())
 	if err != nil || st.ChecksTotal != 6 || st.Changed != 2 || st.Errors != 0 {
 		t.Fatalf("stats=%+v err=%v", st, err)
 	}
@@ -191,18 +192,19 @@ func TestCheckPreparationDoesNotBlockEngine(t *testing.T) {
 	e := newTestEngine(t, manualConfig(), client)
 	p := addPage(t, e, "http://example.test")
 
-	// Occupy the sole DB connection so the worker pauses in preparation, just
+	// Occupy the reader pool so the worker pauses in preparation, just
 	// before comparison. WaitCount identifies this point without CPU timing.
-	conn, err := e.store.db.Conn(context.Background())
+	e.store.readers.SetMaxOpenConns(1)
+	conn, err := e.store.readers.Conn(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	waits := e.store.db.Stats().WaitCount
+	waits := e.store.readers.Stats().WaitCount
 	if err := e.Enqueue(p.ID); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, func() bool { return e.store.db.Stats().WaitCount > waits })
+	eventually(t, func() bool { return e.store.readers.Stats().WaitCount > waits })
 	responsive := make(chan error, 1)
 	go func() {
 		current, err := e.Get(p.ID)
@@ -246,7 +248,7 @@ func TestCheckPreparationDoesNotBlockEngine(t *testing.T) {
 	if err := e.Stop(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	h, err := e.History(p.ID, 100, 0, false)
+	h, err := e.History(context.Background(), p.ID, 100, 0, false)
 	if err != nil || len(h) != 1 || h[0].Status != "initial" {
 		t.Fatalf("shutdown lost the completed result: %v, err=%v", h, err)
 	}
@@ -266,11 +268,11 @@ func TestDeleteDiscardsPreparedCheck(t *testing.T) {
 	if err := e.complete(p.ID, &r.check, v, baseline); err != nil {
 		t.Fatal(err)
 	}
-	h, err := e.History(p.ID, 100, 0, false)
+	h, err := e.History(context.Background(), p.ID, 100, 0, false)
 	if err != nil || len(h) != 0 {
 		t.Fatalf("deleted page received history: %v, err=%v", h, err)
 	}
-	versions, err := e.Versions(p.ID, 100, 0)
+	versions, err := e.Versions(context.Background(), p.ID, 100, 0)
 	if err != nil || len(versions) != 0 {
 		t.Fatalf("deleted page received a version: %v, err=%v", versions, err)
 	}
@@ -321,7 +323,7 @@ func TestHTTPErrorRetryNonHTMLAndSize(t *testing.T) {
 	runCheck(t, e, p, "http_error")
 	mode.Store(1)
 	runCheck(t, e, p, "unchanged")
-	st, _ := e.Stats()
+	st, _ := e.Stats(context.Background())
 	if st.Errors != 4 || st.HTTP4xx != 1 || st.HTTP5xx != 1 {
 		t.Fatal(st)
 	}
@@ -347,7 +349,10 @@ func TestTimeoutDoesNotBlockOtherPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	runCheck(t, e, fast, "initial")
-	eventually(t, func() bool { h, _ := e.History(slow.ID, 100, 0, false); return len(h) == 1 && h[0].Status == "timeout" })
+	eventually(t, func() bool {
+		h, _ := e.History(context.Background(), slow.ID, 100, 0, false)
+		return len(h) == 1 && h[0].Status == "timeout"
+	})
 	runCheck(t, e, slow, "timeout")
 }
 
@@ -385,7 +390,7 @@ func TestSlowPageHasNoDuplicateChecks(t *testing.T) {
 	if peak.Load() != 1 {
 		t.Fatalf("overlapping requests: %d", peak.Load())
 	}
-	h, _ := e.History(p.ID, 100, 0, false)
+	h, _ := e.History(context.Background(), p.ID, 100, 0, false)
 	if len(h) < 2 {
 		t.Fatal("scheduler did not resume")
 	}
@@ -415,7 +420,7 @@ func TestWorkerLimitBoundedQueueAndFairness(t *testing.T) {
 		addPage(t, e, srv.URL)
 	}
 	eventually(t, func() bool {
-		st, err := e.Stats()
+		st, err := e.Stats(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -486,11 +491,11 @@ func TestQueueFullBusyDeleteAndShutdown(t *testing.T) {
 	if !errors.Is(e.Enqueue(r.ID), ErrStopped) {
 		t.Fatal("enqueue after shutdown")
 	}
-	h, _ := e.History(p.ID, 100, 0, false)
+	h, _ := e.History(context.Background(), p.ID, 100, 0, false)
 	if len(h) != 1 || h[0].Status != "cancelled" {
 		t.Fatal(h)
 	}
-	h, _ = e.History(q.ID, 100, 0, false)
+	h, _ = e.History(context.Background(), q.ID, 100, 0, false)
 	if len(h) != 0 {
 		t.Fatal("deleted queued page was checked")
 	}
@@ -514,7 +519,7 @@ func TestConcurrentEnqueueIsAtomic(t *testing.T) {
 			}
 			e.Get(p.ID)
 			e.List(false)
-			e.Stats()
+			e.Stats(context.Background())
 		}()
 	}
 	wg.Wait()
@@ -604,12 +609,15 @@ func TestRestartPersistenceRetentionAndSoftDelete(t *testing.T) {
 	if loaded.Interval != "1h" || len(loaded.Ignore) != 1 {
 		t.Fatal(loaded)
 	}
-	eventually(t, func() bool { h, _ := e.History(p.ID, 100, 0, false); return len(h) == 5 && h[0].Status == "unchanged" })
-	v, err := e.Versions(p.ID, 100, 0)
+	eventually(t, func() bool {
+		h, _ := e.History(context.Background(), p.ID, 100, 0, false)
+		return len(h) == 5 && h[0].Status == "unchanged"
+	})
+	v, err := e.Versions(context.Background(), p.ID, 100, 0)
 	if err != nil || len(v) != 2 {
 		t.Fatalf("retention %v %v", v, err)
 	}
-	h, err := e.History(p.ID, 100, 0, true)
+	h, err := e.History(context.Background(), p.ID, 100, 0, true)
 	if err != nil || len(h) != 3 || h[2].Diff == "" {
 		t.Fatalf("pruning lost history diff: %v, err=%v", h, err)
 	}
@@ -620,7 +628,7 @@ func TestRestartPersistenceRetentionAndSoftDelete(t *testing.T) {
 	if deleted.DeletedAt == nil {
 		t.Fatal("soft delete lost")
 	}
-	qh, _ := e.History(q.ID, 100, 0, false)
+	qh, _ := e.History(context.Background(), q.ID, 100, 0, false)
 	if len(qh) != 1 {
 		t.Fatal("deleted page rechecked or history lost")
 	}
@@ -749,8 +757,8 @@ func TestSchedulerContinuesAfterHTTPError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, func() bool { h, _ := e.History(p.ID, 100, 0, false); return len(h) >= 2 })
-	h, _ := e.History(p.ID, 100, 0, false)
+	eventually(t, func() bool { h, _ := e.History(context.Background(), p.ID, 100, 0, false); return len(h) >= 2 })
+	h, _ := e.History(context.Background(), p.ID, 100, 0, false)
 	if h[len(h)-1].Status != "http_error" || h[len(h)-2].Status != "initial" {
 		t.Fatal(h)
 	}

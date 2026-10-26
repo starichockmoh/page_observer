@@ -1,9 +1,12 @@
 package observer
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -11,23 +14,36 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db      *sql.DB // One writer; SQLite serializes writes.
+	readers *sql.DB
+}
 
 func OpenStore(path string) (*Store, error) {
+	dsn := ":memory:?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	if path != ":memory:" {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
+		}
+		path = absolute
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return nil, err
 		}
+		uriPath := filepath.ToSlash(path)
+		if uriPath[0] != '/' {
+			uriPath = "/" + uriPath
+		}
+		u := url.URL{Scheme: "file", Path: uriPath}
+		dsn = u.String() + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	_, err = db.Exec(`
-PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS pages (
  id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL, interval TEXT NOT NULL,
@@ -55,10 +71,67 @@ CREATE INDEX IF NOT EXISTS checks_version ON checks(version_id);
 		db.Close()
 		return nil, fmt.Errorf("initialize database: %w", err)
 	}
+	if err := s.initializeStats(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initialize statistics: %w", err)
+	}
+	// A private in-memory database cannot use a separate WAL reader pool.
+	s.readers = db
+	if path != ":memory:" {
+		readers, err := sql.Open("sqlite", dsn+"&mode=ro&_pragma=query_only(1)")
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		readers.SetMaxOpenConns(4)
+		readers.SetMaxIdleConns(4)
+		if err := readers.Ping(); err != nil {
+			readers.Close()
+			db.Close()
+			return nil, err
+		}
+		s.readers = readers
+	}
 	return s, nil
 }
 
-func (s *Store) Close() error      { return s.db.Close() }
+// Backfill once for databases created before persistent counters existed.
+func (s *Store) initializeStats() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS check_stats (
+ id INTEGER PRIMARY KEY CHECK(id=1), checks_total INTEGER NOT NULL,
+ changed INTEGER NOT NULL, errors INTEGER NOT NULL, timeouts INTEGER NOT NULL,
+ http4xx INTEGER NOT NULL, http5xx INTEGER NOT NULL, duration_sum_ms INTEGER NOT NULL
+)`); err != nil {
+		return err
+	}
+	var id int
+	err = tx.QueryRow(`SELECT id FROM check_stats WHERE id=1`).Scan(&id)
+	if err == sql.ErrNoRows {
+		_, err = tx.Exec(`INSERT INTO check_stats
+ SELECT 1, COUNT(*), COALESCE(SUM(status='changed'),0),
+ COALESCE(SUM(status NOT IN ('initial','baseline','changed','unchanged','cancelled')),0),
+ COALESCE(SUM(status='timeout'),0), COALESCE(SUM(http_status BETWEEN 400 AND 499),0),
+ COALESCE(SUM(http_status BETWEEN 500 AND 599),0), COALESCE(SUM(duration_ms),0) FROM checks`)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) Close() error {
+	var readErr error
+	if s.readers != s.db {
+		readErr = s.readers.Close()
+	}
+	return errors.Join(readErr, s.db.Close())
+}
+
 func timestamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
 func (s *Store) loadPages() ([]Page, error) {
@@ -124,10 +197,10 @@ func (s *Store) softDelete(id int64, at time.Time) error {
 	return err
 }
 
-func (s *Store) latestVersion(id int64) (*Version, error) {
+func (s *Store) latestVersion(ctx context.Context, id int64) (*Version, error) {
 	var v Version
 	var at string
-	err := s.db.QueryRow(`SELECT id,page_id,checked_at,http_status,content,hash,content_size FROM versions WHERE page_id=? ORDER BY id DESC LIMIT 1`, id).Scan(&v.ID, &v.PageID, &at, &v.HTTPStatus, &v.Content, &v.Hash, &v.ContentSize)
+	err := s.readers.QueryRowContext(ctx, `SELECT id,page_id,checked_at,http_status,content,hash,content_size FROM versions WHERE page_id=? ORDER BY id DESC LIMIT 1`, id).Scan(&v.ID, &v.PageID, &at, &v.HTTPStatus, &v.Content, &v.Hash, &v.ContentSize)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -138,7 +211,7 @@ func (s *Store) latestVersion(id int64) (*Version, error) {
 	return &v, err
 }
 
-// The version, history record, baseline flag and pruning commit atomically.
+// The version, history, counters, baseline flag and pruning commit atomically.
 func (s *Store) saveCheck(c *Check, v *Version, retention int, baseline bool) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -165,6 +238,15 @@ func (s *Store) saveCheck(c *Check, v *Version, retention int, baseline bool) er
 	if err != nil {
 		return err
 	}
+	isError := c.Status != "initial" && c.Status != "baseline" && c.Status != "changed" && c.Status != "unchanged" && c.Status != "cancelled"
+	_, err = tx.Exec(`UPDATE check_stats SET checks_total=checks_total+1,
+ changed=changed+?, errors=errors+?, timeouts=timeouts+?, http4xx=http4xx+?,
+ http5xx=http5xx+?, duration_sum_ms=duration_sum_ms+? WHERE id=1`,
+		c.Status == "changed", isError, c.Status == "timeout", c.HTTPStatus >= 400 && c.HTTPStatus < 500,
+		c.HTTPStatus >= 500 && c.HTTPStatus < 600, c.DurationMS)
+	if err != nil {
+		return err
+	}
 	_, err = tx.Exec(`UPDATE pages SET last_checked_at=?,last_status=?,final_url=?,baseline_pending=? WHERE id=?`, timestamp(c.CheckedAt), c.Status, c.FinalURL, baseline, c.PageID)
 	if err != nil {
 		return err
@@ -178,13 +260,13 @@ func (s *Store) saveCheck(c *Check, v *Version, retention int, baseline bool) er
 	return tx.Commit()
 }
 
-func (s *Store) history(id int64, limit, offset int, changes bool) ([]Check, error) {
+func (s *Store) history(ctx context.Context, id int64, limit, offset int, changes bool) ([]Check, error) {
 	q := `SELECT id,page_id,checked_at,status,http_status,error,duration_ms,original_url,final_url,redirects_json,diff,version_id FROM checks WHERE page_id=?`
 	if changes {
 		q += ` AND status='changed'`
 	}
 	q += ` ORDER BY id DESC LIMIT ? OFFSET ?`
-	rows, err := s.db.Query(q, id, limit, offset)
+	rows, err := s.readers.QueryContext(ctx, q, id, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -213,8 +295,8 @@ func (s *Store) history(id int64, limit, offset int, changes bool) ([]Check, err
 	return out, rows.Err()
 }
 
-func (s *Store) versions(id int64, limit, offset int) ([]Version, error) {
-	rows, err := s.db.Query(`SELECT id,page_id,checked_at,http_status,content,hash,content_size FROM versions WHERE page_id=? ORDER BY id DESC LIMIT ? OFFSET ?`, id, limit, offset)
+func (s *Store) versions(ctx context.Context, id int64, limit, offset int) ([]Version, error) {
+	rows, err := s.readers.QueryContext(ctx, `SELECT id,page_id,checked_at,http_status,content,hash,content_size FROM versions WHERE page_id=? ORDER BY id DESC LIMIT ? OFFSET ?`, id, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -235,11 +317,10 @@ func (s *Store) versions(id int64, limit, offset int) ([]Version, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) stats() (Stats, error) {
+func (s *Store) stats(ctx context.Context) (Stats, error) {
 	var st Stats
-	err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(status='changed'),0),
- COALESCE(SUM(status NOT IN ('initial','baseline','changed','unchanged','cancelled')),0),
- COALESCE(SUM(status='timeout'),0), COALESCE(SUM(http_status BETWEEN 400 AND 499),0),
- COALESCE(SUM(http_status BETWEEN 500 AND 599),0), COALESCE(AVG(duration_ms),0) FROM checks`).Scan(&st.ChecksTotal, &st.Changed, &st.Errors, &st.Timeouts, &st.HTTP4xx, &st.HTTP5xx, &st.AverageDurationMS)
+	err := s.readers.QueryRowContext(ctx, `SELECT checks_total,changed,errors,timeouts,http4xx,http5xx,
+ CASE WHEN checks_total=0 THEN 0.0 ELSE duration_sum_ms*1.0/checks_total END
+ FROM check_stats WHERE id=1`).Scan(&st.ChecksTotal, &st.Changed, &st.Errors, &st.Timeouts, &st.HTTP4xx, &st.HTTP5xx, &st.AverageDurationMS)
 	return st, err
 }
